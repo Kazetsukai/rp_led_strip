@@ -1,73 +1,85 @@
 #![no_std]
 #![no_main]
+#![feature(type_alias_impl_trait)]
+#![feature(impl_trait_in_assoc_type)]
 
+mod usb_device;
 mod ws2812b;
 
 use {
+    core::iter::repeat,
     defmt::*,
     defmt_rtt as _,
     embassy_executor::Spawner,
     embassy_rp::{
         bind_interrupts,
+        dma::{AnyChannel, Channel},
         gpio::{AnyPin, Level, Output},
-        peripherals::PIO0,
-        pio::{InterruptHandler, Pio},
+        peripherals::{DMA_CH0, PIN_16, PIN_23, PIN_5, PIN_8, PIN_9, PIO0, USB},
+        pio::{self, Instance, Pio, PioPin},
+        usb::{self, Driver},
+        Peripheral,
     },
     embassy_time::{Duration, Ticker, Timer},
     panic_probe as _,
-    smart_leds::RGB8,
+    smart_leds::{brightness, gamma, RGB8},
     ws2812b::Ws2812,
 };
 
 bind_interrupts!(struct Irqs {
-    PIO0_IRQ_0 => InterruptHandler<PIO0>;
+    PIO0_IRQ_0 => pio::InterruptHandler<PIO0>;
+    USBCTRL_IRQ => usb::InterruptHandler<USB>;
 });
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
-    let Pio {
-        mut common,
-        sm0,
-        sm1,
-        ..
-    } = Pio::new(p.PIO0, Irqs);
+    info!("Starting up");
 
-    const NUM_LEDS: usize = 10;
+    let atx_ps_on_pin = p.PIN_8;
+    let onboard_led_pin = p.PIN_23;
+    let led_strip_pin = p.PIN_9;
+
+    spawner
+        .spawn(heartbeat(p.PIO0, p.DMA_CH0.into(), led_strip_pin))
+        .unwrap();
+
+    spawner
+        .spawn(usb_device::be_usb_device(spawner, p.USB))
+        .unwrap();
+
+    let _atx_ps_on = Output::new(atx_ps_on_pin, Level::Low);
+
+    let mut ticker = Ticker::every(Duration::from_millis(1000));
+    loop {
+        ticker.next().await;
+    }
+}
+
+#[embassy_executor::task]
+async fn heartbeat(pio: PIO0, dma: AnyChannel, pin: PIN_9) {
+    const NUM_LEDS: usize = 144;
     let mut data = [RGB8::default(); NUM_LEDS];
 
-    let mut onboard_pixel = Ws2812::new(&mut common, sm0, p.DMA_CH0, p.PIN_16);
-    let mut led_strip = Ws2812::new(&mut common, sm1, p.DMA_CH1, p.PIN_29);
+    let Pio {
+        mut common, sm0, ..
+    } = Pio::new(pio, Irqs);
+    let mut ws2812 = Ws2812::new(&mut common, sm0, dma, pin);
 
     // Loop forever making RGB values and pushing them out to the WS2812.
-    let mut ticker = Ticker::every(Duration::from_millis(10));
+    let mut ticker = Ticker::every(Duration::from_millis(5));
     loop {
-        for j in 0..(256 * 5) {
-            debug!("New Colors:");
-            for i in 0..NUM_LEDS {
-                data[i] = wheel((((i * 256) as u16 / NUM_LEDS as u16 + j as u16) & 255) as u8);
-                debug!("R: {} G: {} B: {}", data[i].r, data[i].g, data[i].b);
-            }
-            onboard_pixel.write(&data).await;
-            led_strip.write(&data).await;
+        for j in (0..170).chain((0..170).rev()) {
+            gamma(brightness(
+                repeat(RGB8::new(200, 130, 50)).take(NUM_LEDS),
+                j + 30,
+            ))
+            .enumerate()
+            .for_each(|(i, d)| data[i] = d);
+            ws2812.write(&data).await;
 
             ticker.next().await;
         }
     }
-}
-
-/// Input a value 0 to 255 to get a color value
-/// The colours are a transition r - g - b - back to r.
-fn wheel(mut wheel_pos: u8) -> RGB8 {
-    wheel_pos = 255 - wheel_pos;
-    if wheel_pos < 85 {
-        return (255 - wheel_pos * 3, 0, wheel_pos * 3).into();
-    }
-    if wheel_pos < 170 {
-        wheel_pos -= 85;
-        return (0, wheel_pos * 3, 255 - wheel_pos * 3).into();
-    }
-    wheel_pos -= 170;
-    (wheel_pos * 3, 255 - wheel_pos * 3, 0).into()
 }
