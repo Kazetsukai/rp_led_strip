@@ -1,28 +1,42 @@
+use core::include_bytes;
 use defmt::{info, warn};
 use embassy_executor::Spawner;
 use embassy_net::{Ipv4Address, Ipv4Cidr, Stack, StackResources};
 use embassy_rp::{clocks::RoscRng, peripherals::USB, usb::Driver};
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
 use embassy_time::{Duration, Timer};
 use embassy_usb::{
     class::cdc_ncm::{
+        self,
         embassy_net::{Device, Runner, State as NetState},
-        CdcNcmClass, State,
+        CdcNcmClass,
     },
     UsbDevice,
 };
 use heapless::Vec;
-use picoserve::{routing::get, Router};
+use picoserve::{
+    extract,
+    request::{self, Request},
+    response::{json, File, IntoResponse},
+    routing::{get, get_service, post},
+    Router,
+};
 use rand::RngCore;
+use smart_leds::RGB8;
 use static_cell::{make_static, StaticCell};
 
+use crate::state::{AppState, LedControls, SharedState};
 use crate::Irqs;
 
 const MTU: usize = 1514;
+const INDEX_HTML: &str = include_str!("../static/index.html");
+const STYLE_CSS: &str = include_str!("../static/style.css");
+const SCRIPT_JS: &str = include_str!("../static/script.js");
 
-type AppRouter = impl picoserve::routing::PathRouter;
+type AppRouter = impl picoserve::routing::PathRouter<AppState>;
 
 #[embassy_executor::task]
-pub async fn be_usb_device(spawner: Spawner, usb: USB) {
+pub async fn be_usb_device(spawner: Spawner, usb: USB, state: &'static SharedState) {
     info!("USB device task started");
     let driver = Driver::new(usb, Irqs);
     let mut rng = RoscRng;
@@ -63,9 +77,9 @@ pub async fn be_usb_device(spawner: Spawner, usb: USB) {
     let host_mac_addr = [0x82, 0x88, 0x88, 0x88, 0x88, 0x88];
 
     // Create classes on the builder.
-    let mut class = {
-        static STATE: StaticCell<State> = StaticCell::new();
-        let state = STATE.init(State::new());
+    let class = {
+        static STATE: StaticCell<cdc_ncm::State> = StaticCell::new();
+        let state = STATE.init(cdc_ncm::State::new());
         CdcNcmClass::new(&mut builder, state, host_mac_addr, 64)
     };
 
@@ -103,8 +117,26 @@ pub async fn be_usb_device(spawner: Spawner, usb: USB) {
     spawner.must_spawn(net_task(stack));
     info!("Network task started");
 
-    fn make_app() -> Router<AppRouter> {
-        picoserve::Router::new().route("/", get(|| async move { "Hello World" }))
+    async fn get_state(
+        extract::State(SharedState(leds)): extract::State<SharedState>,
+    ) -> impl IntoResponse {
+        json::Json(*leds.lock().await)
+    }
+
+    fn make_app() -> Router<AppRouter, AppState> {
+        picoserve::Router::new()
+            .route("/", get_service(File::html(INDEX_HTML)))
+            .route("/style.css", get_service(File::css(STYLE_CSS)))
+            .route("/script.js", get_service(File::javascript(SCRIPT_JS)))
+            .route("/state", get(get_state))
+            .route(
+                "/toggle_power",
+                post(|extract::State(SharedState(state))| async move {
+                    let mut leds = state.lock().await;
+                    leds.power = !leds.power;
+                    json::Json("ok")
+                }),
+            )
     }
 
     let app = make_static!(make_app());
@@ -117,7 +149,15 @@ pub async fn be_usb_device(spawner: Spawner, usb: USB) {
     .keep_connection_alive());
 
     for id in 0..WEB_TASK_POOL_SIZE {
-        spawner.must_spawn(web_task(id, stack, app, config));
+        spawner.must_spawn(web_task(
+            id,
+            stack,
+            app,
+            config,
+            AppState {
+                shared_state: *state,
+            },
+        ));
     }
 }
 
@@ -127,15 +167,16 @@ const WEB_TASK_POOL_SIZE: usize = 8;
 async fn web_task(
     id: usize,
     stack: &'static Stack<Device<'static, MTU>>,
-    app: &'static Router<AppRouter>,
+    app: &'static Router<AppRouter, AppState>,
     config: &'static picoserve::Config<Duration>,
+    state: AppState,
 ) -> ! {
     let port = 80;
     let mut tcp_rx_buffer = [0; 1024];
     let mut tcp_tx_buffer = [0; 1024];
     let mut http_buffer = [0; 2048];
 
-    picoserve::listen_and_serve(
+    picoserve::listen_and_serve_with_state(
         id,
         app,
         config,
@@ -144,6 +185,7 @@ async fn web_task(
         &mut tcp_rx_buffer,
         &mut tcp_tx_buffer,
         &mut http_buffer,
+        &state,
     )
     .await
 }

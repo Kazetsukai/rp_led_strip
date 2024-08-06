@@ -3,6 +3,7 @@
 #![feature(type_alias_impl_trait)]
 #![feature(impl_trait_in_assoc_type)]
 
+mod state;
 mod usb_device;
 mod ws2812b;
 
@@ -20,9 +21,12 @@ use {
         usb::{self, Driver},
         Peripheral,
     },
+    embassy_sync::mutex::Mutex,
     embassy_time::{Duration, Ticker, Timer},
     panic_probe as _,
     smart_leds::{brightness, gamma, RGB8},
+    state::{AppState, SharedState},
+    static_cell::make_static,
     ws2812b::Ws2812,
 };
 
@@ -41,12 +45,24 @@ async fn main(spawner: Spawner) {
     let onboard_led_pin = p.PIN_23;
     let led_strip_pin = p.PIN_9;
 
+    let shared_state = make_static!(state::SharedState(make_static!(Mutex::new(
+        state::LedControls {
+            color: RGB8::default().into(),
+            power: false,
+        }
+    ))));
+
     spawner
-        .spawn(heartbeat(p.PIO0, p.DMA_CH0.into(), led_strip_pin))
+        .spawn(heartbeat(
+            p.PIO0,
+            p.DMA_CH0.into(),
+            led_strip_pin,
+            shared_state,
+        ))
         .unwrap();
 
     spawner
-        .spawn(usb_device::be_usb_device(spawner, p.USB))
+        .spawn(usb_device::be_usb_device(spawner, p.USB, shared_state))
         .unwrap();
 
     let _atx_ps_on = Output::new(atx_ps_on_pin, Level::Low);
@@ -58,7 +74,12 @@ async fn main(spawner: Spawner) {
 }
 
 #[embassy_executor::task]
-async fn heartbeat(pio: PIO0, dma: AnyChannel, pin: PIN_9) {
+async fn heartbeat(
+    pio: PIO0,
+    dma: AnyChannel,
+    pin: PIN_9,
+    shared_state: &'static state::SharedState,
+) {
     const NUM_LEDS: usize = 144;
     let mut data = [RGB8::default(); NUM_LEDS];
 
@@ -71,12 +92,23 @@ async fn heartbeat(pio: PIO0, dma: AnyChannel, pin: PIN_9) {
     let mut ticker = Ticker::every(Duration::from_millis(5));
     loop {
         for j in (0..170).chain((0..170).rev()) {
-            gamma(brightness(
-                repeat(RGB8::new(200, 130, 50)).take(NUM_LEDS),
-                j + 30,
-            ))
-            .enumerate()
-            .for_each(|(i, d)| data[i] = d);
+            let SharedState(leds) = shared_state;
+            let power = leds.lock().await.power;
+
+            if power {
+                gamma(brightness(
+                    repeat(RGB8::new(200, 130, 50)).take(NUM_LEDS),
+                    j + 30,
+                ))
+                .enumerate()
+                .for_each(|(i, d)| data[i] = d);
+            } else {
+                repeat(RGB8::default())
+                    .take(NUM_LEDS)
+                    .enumerate()
+                    .for_each(|(i, d)| data[i] = d);
+            }
+
             ws2812.write(&data).await;
 
             ticker.next().await;
