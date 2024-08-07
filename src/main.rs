@@ -25,7 +25,7 @@ use {
     embassy_time::{Duration, Ticker, Timer},
     panic_probe as _,
     smart_leds::{brightness, gamma, RGB8},
-    state::{AppState, SharedState},
+    state::{AppState, LedControls, SharedState},
     static_cell::make_static,
     ws2812b::Ws2812,
 };
@@ -93,11 +93,11 @@ async fn heartbeat(
     loop {
         for j in (0..170).chain((0..170).rev()) {
             let SharedState(leds) = shared_state;
-            let power = leds.lock().await.power;
-
+            let LedControls { power, color } = *leds.lock().await;
+            let rgb: RGB8 = color.into();
             if power {
                 gamma(brightness(
-                    repeat(RGB8::new(200, 130, 50)).take(NUM_LEDS),
+                    repeat(RGB8::new(rgb.r, rgb.g, rgb.b)).take(NUM_LEDS),
                     j + 30,
                 ))
                 .enumerate()

@@ -13,12 +13,13 @@ use embassy_usb::{
     },
     UsbDevice,
 };
+use fixed::types::extra;
 use heapless::Vec;
 use picoserve::{
     extract,
     request::{self, Request},
-    response::{json, File, IntoResponse},
-    routing::{get, get_service, post},
+    response::{json, File, IntoResponse, StatusCode},
+    routing::{get, get_service, parse_path_segment, post},
     Router,
 };
 use rand::RngCore;
@@ -34,6 +35,13 @@ const STYLE_CSS: &str = include_str!("../static/style.css");
 const SCRIPT_JS: &str = include_str!("../static/script.js");
 
 type AppRouter = impl picoserve::routing::PathRouter<AppState>;
+
+#[derive(serde::Deserialize)]
+struct ColorFormValue {
+    r: u8,
+    g: u8,
+    b: u8,
+}
 
 #[embassy_executor::task]
 pub async fn be_usb_device(spawner: Spawner, usb: USB, state: &'static SharedState) {
@@ -134,6 +142,20 @@ pub async fn be_usb_device(spawner: Spawner, usb: USB, state: &'static SharedSta
                 post(|extract::State(SharedState(state))| async move {
                     let mut leds = state.lock().await;
                     leds.power = !leds.power;
+                    json::Json("ok")
+                }),
+            )
+            .route(
+                (
+                    "/set_color",
+                    parse_path_segment(),
+                    parse_path_segment(),
+                    parse_path_segment(),
+                ),
+                post(|(r, g, b), extract::State(SharedState(state))| async move {
+                    let color = RGB8 { r, g, b };
+                    let mut leds = state.lock().await;
+                    leds.color = color.into();
                     json::Json("ok")
                 }),
             )
