@@ -1,7 +1,12 @@
-use core::include_bytes;
+use core::{
+    cmp::{max, min},
+    include_bytes,
+};
 use defmt::{info, warn};
 use embassy_executor::Spawner;
-use embassy_net::{Ipv4Address, Ipv4Cidr, Stack, StackResources};
+use embassy_net::{
+    udp::PacketMetadata, IpListenEndpoint, Ipv4Address, Ipv4Cidr, Stack, StackResources,
+};
 use embassy_rp::{clocks::RoscRng, peripherals::USB, usb::Driver};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
 use embassy_time::{Duration, Timer};
@@ -44,7 +49,12 @@ struct ColorFormValue {
 }
 
 #[embassy_executor::task]
-pub async fn be_usb_device(spawner: Spawner, usb: USB, state: &'static SharedState) {
+pub async fn be_usb_device(
+    spawner: Spawner,
+    usb: USB,
+    state: &'static SharedState,
+    led_colors: &'static Mutex<CriticalSectionRawMutex, [RGB8; crate::NUM_LEDS]>,
+) {
     info!("USB device task started");
     let driver = Driver::new(usb, Irqs);
     let mut rng = RoscRng;
@@ -125,6 +135,9 @@ pub async fn be_usb_device(spawner: Spawner, usb: USB, state: &'static SharedSta
     spawner.must_spawn(net_task(stack));
     info!("Network task started");
 
+    spawner.must_spawn(udp_task(stack, led_colors));
+    info!("UDP task started");
+
     async fn get_state(
         extract::State(SharedState(leds)): extract::State<SharedState>,
     ) -> impl IntoResponse {
@@ -183,7 +196,7 @@ pub async fn be_usb_device(spawner: Spawner, usb: USB, state: &'static SharedSta
     }
 }
 
-const WEB_TASK_POOL_SIZE: usize = 8;
+const WEB_TASK_POOL_SIZE: usize = 3;
 
 #[embassy_executor::task(pool_size = WEB_TASK_POOL_SIZE)]
 async fn web_task(
@@ -210,6 +223,59 @@ async fn web_task(
         &state,
     )
     .await
+}
+
+#[embassy_executor::task]
+async fn udp_task(
+    stack: &'static Stack<Device<'static, MTU>>,
+    led_colors: &'static Mutex<CriticalSectionRawMutex, [RGB8; crate::NUM_LEDS]>,
+) -> ! {
+    let mut udp_rx_buffer = [0; 2048];
+    let mut udp_tx_buffer = [0; 2048];
+    let mut rx_meta: [PacketMetadata; 1024] = [PacketMetadata::EMPTY; 1024];
+    let mut tx_meta: [PacketMetadata; 1024] = [PacketMetadata::EMPTY; 1024];
+
+    let mut udp_recv_buffer = [0; 4096];
+
+    let mut udp_socket = embassy_net::udp::UdpSocket::new(
+        stack,
+        &mut rx_meta,
+        &mut udp_rx_buffer,
+        &mut tx_meta,
+        &mut udp_tx_buffer,
+    );
+
+    udp_socket
+        .bind(IpListenEndpoint {
+            addr: None,
+            port: 7777,
+        })
+        .unwrap();
+
+    loop {
+        let (n, addr) = udp_socket.recv_from(&mut udp_recv_buffer).await.unwrap();
+        let data = &udp_recv_buffer[..n];
+        if data[0] != 4 {
+            warn!("Invalid packet!");
+            continue;
+        }
+
+        let _timeout = data[1];
+        let idx_start = u16::from_be_bytes([data[2], data[3]]);
+        let count = min((n - 4) / 3, crate::NUM_LEDS);
+
+        {
+            let mut colors = led_colors.lock().await;
+            for i in 0..count {
+                let idx = 4 + i * 3;
+                colors[idx_start as usize + i] = RGB8 {
+                    r: data[idx],
+                    g: data[idx + 1],
+                    b: data[idx + 2],
+                };
+            }
+        }
+    }
 }
 
 #[embassy_executor::task]
